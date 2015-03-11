@@ -2,6 +2,12 @@
 #include <stdlib.h>
 #include <math.h>
 #include <AccelStepper.h>
+#include <TinyGPS.h>
+#include <Wire.h>
+#include <LSM303.h>
+#include <SoftwareSerial.h>
+/* The compass declination lookup table is not yet working properly*/
+//#include <AP_Declination.h> 
 
 #define DIR_AZ 18 //PIN for Azimuth Direction
 #define STEP_AZ 10 //PIN for Azimuth Steps
@@ -26,9 +32,26 @@
 
 /*Global Variables*/
 unsigned long t_DIS = 0; //time to disable the Motors
+unsigned long fix_age, time, date;
+float flat, flon, falt, Heading, Pitch, Roll;
+
+/*Set Angular deviation of your board to actual heading and pitch here*/
+float devHeading = 0, devPitch = 0;
+
+/*Enter the magnetical declination of your position here,
+ *as long as declination lookup Table is not working */
+float declinationAngle = 1+53/60;  
+
 /*Define a stepper and the pins it will use*/
 AccelStepper AZstepper(1, STEP_AZ, DIR_AZ);
 AccelStepper ELstepper(1, STEP_EL, DIR_EL);
+
+/*Create GPS instance*/
+TinyGPS gps;
+SoftwareSerial gpsSerial(5, 4);
+
+/*Create Accelerometer & Compass instance*/
+LSM303 compass;
 
 void setup()
 {  
@@ -51,6 +74,22 @@ void setup()
   pinMode(HOME_EL, INPUT);
   /*Serial Communication*/
   Serial.begin(19200);
+  Wire.begin();
+  gpsSerial.begin(9600);
+  compass.init();
+  compass.enableDefault();
+  
+  /*
+  Calibration values; the default values of +/-32767 for each axis
+  lead to an assumed magnetometer bias of 0. Use the Calibrate example
+  program to determine appropriate values for your particular unit.
+  */
+  compass.m_min = (LSM303::vector<int16_t>){-32767, -32767, -32767};
+  compass.m_max = (LSM303::vector<int16_t>){+32767, +32767, +32767};
+  
+  /*Initial GPS Position*/
+  StatGpsPos(100);
+  
   /*Initial Homing*/
   Homing(deg2step(-ANGLE_SCANNING_MULT), deg2step(-ANGLE_SCANNING_MULT));
 }
@@ -78,6 +117,73 @@ void loop()
   /*Move the Azimuth & Elevation Motor*/
   stepper_move(AZstep, ELstep);
 }
+
+/*GPS static Position retrieval*/
+void StatGpsPos(int NumReads)
+{
+  unsigned long start = millis();
+  int ReadCount = 0;
+  float tempflat = 0, tempflon = 0, tempfalt = 0;
+  do
+  {
+    while (gpsSerial.available())
+    {
+      int c = gpsSerial.read();
+      if (gps.encode(c))
+      {
+        gps.f_get_position(&flat, &flon, &fix_age);
+        falt = gps.f_altitude();
+        tempflat = tempflat+flat;
+        tempflon = tempflon + flon;
+        tempfalt = tempfalt + falt;
+        ReadCount = ReadCount + 1;
+        
+        /*Average position when desired number of reads is accomplished*/
+        if (ReadCount >= NumReads)  
+        {
+          flat = tempflat/ReadCount;
+          flon = tempflon/ReadCount;
+          falt = tempfalt/ReadCount;
+          gps.get_datetime(&date, &time, &fix_age);
+          /* Compass Declination lookup table not working yet
+          declinationAngle = AP_Declination::get_declination(flat, flon); 
+          */
+          break;
+        }
+      }
+    }
+    delay(10);
+  } while (millis() - start < 60000); 
+  if (ReadCount != NumReads)
+  {
+    error(2);
+  }
+}
+
+/*Get tilt compensated Compass heading*/
+void get_TiltHeading(void)
+{
+  compass.read();
+   // Normalize acceleration measurements so they range from 0 to 1
+  float accxnorm = compass.a.x/sqrt(compass.a.x*compass.a.x+compass.a.x*compass.a.x+compass.a.x*compass.a.x);
+  float accynorm = compass.a.y/sqrt(compass.a.y*compass.a.y+compass.a.y*compass.a.y+compass.a.y*compass.a.y);
+
+  // calculate pitch and roll
+  Pitch = asin(-accxnorm);
+  Roll = asin(accynorm/cos(Pitch));
+
+  // tilt compensated magnetic sensor measurements
+  float magxcomp = compass.m.x*cos(Pitch)+compass.m.z*sin(Pitch);
+  float magycomp = compass.m.x*sin(Roll)*sin(Pitch)+compass.m.y*cos(Roll)-compass.m.z*sin(Roll)*cos(Pitch);
+
+  // arctangent of y/x converted to degrees & add declination and deviation
+  Heading = 180*atan2(magycomp,magxcomp)/PI+declinationAngle+devHeading;
+
+  if (Heading < 0)
+      Heading +=360; 
+  Pitch += devPitch;  //add Pitch deviation
+  }  
+
 
 /*Homing Function*/
 void Homing(int AZsteps, int ELsteps)
@@ -141,9 +247,13 @@ void Homing(int AZsteps, int ELsteps)
     AZstepper.run();
     ELstepper.run();
   }
+  
+  /*Read Compass Heading and Compensate Tilt & Declination*/
+  get_TiltHeading();
+    
   /*Reset the steps*/
-  AZstepper.setCurrentPosition(0);
-  ELstepper.setCurrentPosition(0); 
+  AZstepper.setCurrentPosition(deg2step(Heading));
+  ELstepper.setCurrentPosition(deg2step(Pitch)); 
 }
  
 /*EasyComm 2 Protocol & Calculate the steps*/
@@ -271,6 +381,12 @@ void error(int num_error)
         Serial.println("AL002");
         delay(100);
       }
+    /*GPS error*/
+    case (2):
+      {
+        Serial.println("AL003");
+        delay(100);
+      }
     default:
       while(1)
       {
@@ -300,4 +416,18 @@ int deg2step(double deg)
 double step2deg(int Step)
 {
   return(360.00*Step/(SPR*RATIO));
+}
+
+/*Convert Radians to Degrees*/
+float RadiansToDegrees(float rads)
+{
+  // Correct for when signs are reversed.
+  if(rads < 0)
+    rads += 2*PI;
+  // Check for wrap due to addition of declination.
+  if(rads > 2*PI)
+    rads -= 2*PI;
+  // Convert radians to degrees for readability.
+  float heading = rads * 180/PI;
+  return heading;
 }
