@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <AccelStepper.h>
-#include <TinyGPS.h>
+#include <TinyGPS++.h>
 #include <Wire.h>
 #include <LSM303.h>
 #include <SoftwareSerial.h>
@@ -33,7 +33,9 @@
 /*Global Variables*/
 unsigned long t_DIS = 0; //time to disable the Motors
 unsigned long fix_age, time, date;
-float flat, flon, falt, Heading, Pitch, Roll;
+//float flat, flon, falt; //TingyGPS
+float Heading, Pitch, Roll;
+double dlat, dlon, dalt;
 
 /*Set Angular deviation of your board to actual heading and pitch here*/
 float devHeading = 0, devPitch = 0;
@@ -47,8 +49,11 @@ AccelStepper AZstepper(1, STEP_AZ, DIR_AZ);
 AccelStepper ELstepper(1, STEP_EL, DIR_EL);
 
 /*Create GPS instance*/
-TinyGPS gps;
-SoftwareSerial gpsSerial(5, 4);
+static const int RXPin = 5, TXPin = 4;
+static const uint32_t GPSBaud = 9600;
+TinyGPSPlus gps;
+SoftwareSerial gpsSerial(RXPin, TXPin);
+TinyGPSCustom pdop(gps, "GPGSA", 15); // $GPGSA sentence, 15th element
 
 /*Create Accelerometer & Compass instance*/
 LSM303 compass;
@@ -75,7 +80,7 @@ void setup()
   /*Serial Communication*/
   Serial.begin(19200);
   Wire.begin();
-  gpsSerial.begin(9600);
+  gpsSerial.begin(GPSBaud);
   compass.init();
   compass.enableDefault();
   
@@ -88,7 +93,7 @@ void setup()
   compass.m_max = (LSM303::vector<int16_t>){+32767, +32767, +32767};
   
   /*Initial GPS Position*/
-  StatGpsPos(100);
+  StatGpsPos(15);
   
   /*Initial Homing*/
   Homing(deg2step(-ANGLE_SCANNING_MULT), deg2step(-ANGLE_SCANNING_MULT));
@@ -123,30 +128,44 @@ void StatGpsPos(int NumReads)
 {
   unsigned long start = millis();
   int ReadCount = 0;
-  float tempflat = 0, tempflon = 0, tempfalt = 0;
+  //float tempflat = 0, tempflon = 0, tempfalt = 0;  //TinyGPS
+  double tempdlat = 0, tempdlon = 0, tempdalt = 0;
   do
   {
-    while (gpsSerial.available())
+    //while (gpsSerial.available()) //TinyGPS
+    while (gpsSerial.available() > 0) //TinyGPS++
     {
-      int c = gpsSerial.read();
-      if (gps.encode(c))
+      //int c = gpsSerial.read(); //TinyGPS
+      //if (gps.encode(c)) //TinyGPS
+      if (gps.encode(gpsSerial.read()) && gps.satellites.value() >= 8 && *pdop.value() < 4)
       {
-        gps.f_get_position(&flat, &flon, &fix_age);
-        falt = gps.f_altitude();
-        tempflat = tempflat+flat;
-        tempflon = tempflon + flon;
-        tempfalt = tempfalt + falt;
-        ReadCount = ReadCount + 1;
+        //gps.f_get_position(&flat, &flon, &fix_age);  //TinypGPS
+        //falt = gps.f_altitude();
+        dlat = gps.location.lat();
+        dlon = gps.location.lng();
+        dalt = gps.altitude.meters();
+        //tempflat = tempflat+flat;  //TinyGPS
+        //tempflon = tempflon + flon;
+        //tempfalt = tempfalt + falt;
+        tempdlat += dlat;
+        tempdlon += dlon;
+        tempdalt += dalt;
+        ReadCount += 1;
         
         /*Average position when desired number of reads is accomplished*/
         if (ReadCount >= NumReads)  
         {
-          flat = tempflat/ReadCount;
-          flon = tempflon/ReadCount;
-          falt = tempfalt/ReadCount;
-          gps.get_datetime(&date, &time, &fix_age);
+          //flat = tempflat/ReadCount;  //TinyGPS
+          //flon = tempflon/ReadCount;
+          //falt = tempfalt/ReadCount;
+          //gps.get_datetime(&date, &time, &fix_age);
+          dlat = tempdlat/ReadCount;
+          dlon = tempdlon/ReadCount;
+          dalt = tempdalt/ReadCount;
+          
           /* Compass Declination lookup table not working yet
-          declinationAngle = AP_Declination::get_declination(flat, flon); 
+          //declinationAngle = AP_Declination::get_declination(flat, flon); //TinyGPS
+          //declinationAngle = AP_Declination::get_declination(dlat, dlon);
           */
           break;
         }
